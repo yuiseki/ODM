@@ -4,6 +4,7 @@ import rasterio
 import math
 import shutil
 import glob
+import json
 import re
 from opendm.system import run
 from opendm import point_cloud
@@ -65,6 +66,113 @@ def rectify(lasFile, reclassify_threshold=5, min_area=750, min_points=500):
 
 error = None
 
+def compute_outlier_safe_bounds(input_point_cloud, resolution, percentile=1.0,
+                                inflation_threshold=10.0, min_raster_mp=100.0,
+                                sample_size=200000):
+    """Compute a robust XY window for DEM rasterization, ignoring gross outliers.
+
+    Sparse SfM/MVS outliers (common with weak baselines, low overlap or non-nadir
+    captures) can inflate a point cloud's bounding box by orders of magnitude.
+    renderdem rasterizes the full bounding box, so a handful of stray points can
+    turn a few-megapixel DEM into a multi-gigapixel one -- making DEM/mesh
+    generation take many minutes on a mostly-empty raster (and yielding a DEM that
+    spans kilometers when the real scene is only tens of meters across).
+
+    A point cloud sample is taken and a [percentile, 100 - percentile] window is
+    computed per axis. The window is returned ONLY when both guards trip: the raw
+    extent area is at least ``inflation_threshold`` times larger than the robust
+    one (a clear outlier signature), AND the full extent implies a raster of more
+    than ``min_raster_mp`` megapixels (i.e. it is actually large enough to be a
+    performance problem). Otherwise ``None`` is returned so normal datasets are
+    left untouched.
+
+    :return: (minx, miny, maxx, maxy) or None
+    """
+    try:
+        import pdal
+        import numpy as np
+    except Exception as e:
+        log.ODM_WARNING("Cannot compute outlier-safe DEM bounds (%s)" % str(e))
+        return None
+
+    try:
+        # quickinfo reads header/metadata only (no full point read): gives us the
+        # point count and the raw bounds cheaply.
+        count = 0
+        raw_bounds = None
+        for v in pdal.Pipeline(json.dumps([input_point_cloud])).quickinfo.values():
+            if isinstance(v, dict):
+                count = v.get("num_points") or count
+                raw_bounds = v.get("bounds") or raw_bounds
+        if count < 100:
+            return None
+
+        # Fast exit: if the raw extent already implies a small raster there is
+        # nothing to fix, so we never touch the points. This keeps the whole
+        # function almost free for normal datasets.
+        if raw_bounds is not None:
+            rw = raw_bounds["maxx"] - raw_bounds["minx"]
+            rh = raw_bounds["maxy"] - raw_bounds["miny"]
+            if rw * rh / (resolution * resolution) / 1e6 < min_raster_mp:
+                return None
+
+        step = max(1, count // sample_size)
+        pipeline = pdal.Pipeline(json.dumps([
+            input_point_cloud,
+            {"type": "filters.decimation", "step": step}
+        ]))
+        pipeline.execute()
+        arr = pipeline.arrays[0]
+        if len(arr) < 100:
+            return None
+
+        x = arr["X"].astype(np.float64)
+        y = arr["Y"].astype(np.float64)
+
+        rminx, rmaxx = np.percentile(x, [percentile, 100.0 - percentile])
+        rminy, rmaxy = np.percentile(y, [percentile, 100.0 - percentile])
+        fminx, fmaxx = float(x.min()), float(x.max())
+        fminy, fmaxy = float(y.min()), float(y.max())
+
+        robust_area = max(1e-9, (rmaxx - rminx) * (rmaxy - rminy))
+        full_area = max(1e-9, (fmaxx - fminx) * (fmaxy - fminy))
+
+        full_raster_mp = full_area / (resolution * resolution) / 1e6
+        # Two independent guards so well-behaved data is never touched:
+        #  - the raw extent must be dramatically larger than the robust one
+        #    (a clear outlier signature, not merely dense data reaching the edges)
+        #  - the raster it implies must actually be large enough to be a problem
+        if full_area < robust_area * inflation_threshold or full_raster_mp < min_raster_mp:
+            return None  # Not outlier-dominated, or not large enough to matter.
+
+        # Pad the robust window a little so valid edge data is not clipped.
+        padx = (rmaxx - rminx) * 0.05
+        pady = (rmaxy - rminy) * 0.05
+        bounds = (rminx - padx, rminy - pady, rmaxx + padx, rmaxy + pady)
+
+        log.ODM_WARNING(
+            "Point cloud extent is %.0fx larger than the robust extent "
+            "(%.0f x %.0f m vs %.0f x %.0f m), which indicates gross outliers. "
+            "Cropping the DEM extent to the robust window to avoid generating a "
+            "huge, mostly-empty raster." % (
+                full_area / robust_area,
+                fmaxx - fminx, fmaxy - fminy,
+                rmaxx - rminx, rmaxy - rminy))
+        return bounds
+    except Exception as e:
+        log.ODM_WARNING("Could not compute outlier-safe DEM bounds (%s)" % str(e))
+        return None
+
+
+def crop_point_cloud_to_bounds(input_point_cloud, output_point_cloud, bounds):
+    """Crop a point cloud to a 2D window (minx, miny, maxx, maxy) using PDAL."""
+    minx, miny, maxx, maxy = bounds
+    run('pdal translate -i "%s" -o "%s" crop '
+        '--filters.crop.bounds="([%s,%s],[%s,%s])"' % (
+            input_point_cloud, output_point_cloud, minx, maxx, miny, maxy))
+    return output_point_cloud
+
+
 def create_dem(input_point_cloud, dem_type, output_type='max', radiuses=['0.56'], gapfill=True,
                 outdir='', resolution=0.1, max_workers=1, max_tile_size=4096,
                 decimation=None, with_euclidean_map=False,
@@ -72,6 +180,24 @@ def create_dem(input_point_cloud, dem_type, output_type='max', radiuses=['0.56']
     """ Create DEM from multiple radii, and optionally gapfill """
     
     start = datetime.now()
+    # Reject gross outliers that would otherwise inflate the raster size by
+    # orders of magnitude (which makes renderdem/gdal/dem2mesh process a huge,
+    # mostly-empty raster). No-op for well-behaved point clouds.
+    outlier_cropped_pc = None
+    safe_bounds = compute_outlier_safe_bounds(input_point_cloud, resolution)
+    if safe_bounds is not None:
+        outlier_cropped_pc = os.path.join(
+            outdir, "outlier_cropped_%s%s" % (dem_type, os.path.splitext(input_point_cloud)[1]))
+        try:
+            crop_point_cloud_to_bounds(input_point_cloud, outlier_cropped_pc, safe_bounds)
+            if os.path.isfile(outlier_cropped_pc):
+                input_point_cloud = outlier_cropped_pc
+            else:
+                outlier_cropped_pc = None
+        except Exception as e:
+            log.ODM_WARNING("Outlier crop failed, using original point cloud (%s)" % str(e))
+            outlier_cropped_pc = None
+
     kwargs = {
         'input': input_point_cloud,
         'outdir': outdir,
@@ -190,7 +316,10 @@ def create_dem(input_point_cloud, dem_type, output_type='max', radiuses=['0.56']
             emap_path = io.related_file_path(output_path, postfix=".euclideand")
             compute_euclidean_map(tiles_vrt_path, emap_path, overwrite=True)
     
-    for cleanup_file in [tiles_vrt_path, tiles_file_list, merged_vrt_path, geotiff_small_path, geotiff_small_filled_path]:
+    cleanup_files = [tiles_vrt_path, tiles_file_list, merged_vrt_path, geotiff_small_path, geotiff_small_filled_path]
+    if outlier_cropped_pc is not None:
+        cleanup_files.append(outlier_cropped_pc)
+    for cleanup_file in cleanup_files:
         if os.path.exists(cleanup_file): os.remove(cleanup_file)
 
     for t in tiles:
